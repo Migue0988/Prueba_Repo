@@ -1,1 +1,1903 @@
 Iniciamos 
+
+Pruebas para realizar un proceso casi completo
+
+
+
+
+<?php
+
+namespace TuRecibo\Api\App\Controllers;
+
+use Predis\Collection\Iterator\Keyspace;
+use Slim\Http\Request;
+use Slim\Http\Response;
+use TuRecibo\Api\App\Core\PaginationRequest;
+use TuRecibo\Api\Portable\JsonViewer\JsonPagination;
+use TuRecibo\Api\App\Core\BaseController;
+use TuRecibo\Api\App\Core\DBRedis;
+use TuRecibo\Api\App\Libs\Licenses\Manager;
+use TuRecibo\Api\App\Libs\Licenses\LicensesCreator;
+use TuRecibo\Api\App\Models\Licencias;
+use TuRecibo\Api\App\Models\LicenciasEmpresas;
+use TuRecibo\Api\App\Models\LicenciasFeriados;
+use TuRecibo\Api\App\Models\LicenciasMovimientos;
+use TuRecibo\Api\App\Models\LicenciasPoliticas;
+use TuRecibo\Api\App\Models\LicenciasPoliticasReglas;
+use TuRecibo\Api\App\Models\LicenciasSubtipo;
+use TuRecibo\Api\App\Models\LicenciasTipos;
+use TuRecibo\Api\App\Models\Usuario;
+use TuRecibo\Api\App\Models\Perfil;
+use TuRecibo\Api\App\Models\PerfilAccion;
+use TuRecibo\Api\App\Models\Pais;
+use TuRecibo\Api\Portable\Entities\Date;
+use TuRecibo\Api\Portable\JsonViewer\JsonResponse;
+
+class LicensesAdminController extends BaseController {
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to obtain information from holidays",
+     *      path = "/licensesAdmin/approve",
+     *      @SWG\Parameter(
+     *          name = "idsol",
+     *          description = "solicitude ID for HR or Admin",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "observation",
+     *          description = "observation",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "user_approver",
+     *          description = "user approver ID for the next level approve",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "password",
+     *          description = "User password",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function approve(Request $request, Response $response) {
+        /* @var $conf LicenciasEmpresas */
+        /* @var $lastSol LicenciasMovimientos */
+        /* @var $usuarioAprobador Usuario */
+        
+        $vars = $request->getParsedBody();
+    
+        //Valid Pass
+        if(array_key_exists("password", $vars)){
+            $validPass = $this->validPass($request, pg_escape_string($vars['password']));
+            if ($this->hasErrors()) {
+                return $this->returnError($response, null, 401);
+            }
+        }else{
+            return $this->returnError($response, ['No se ha ingresado la contraseña.'], 401);
+        }
+        
+
+        $user = $this->getRecentUser($request);
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+        
+        if ($user->getIsOnlyEmployee()) {
+            return $this->returnError($response, ['No tiene permiso para aprobar licencias.']);
+        }
+        $idUser = $user->getId();
+
+        $idEmpresa = $user->getEmpresa()->getIdempresa();
+        $estadoTo = 0;
+        $sCconf = new LicenciasEmpresas($this->collection);
+        $conf = $sCconf->buscarPorPropiedades(['idempresa' => $idEmpresa]);
+        if (empty($conf)) {
+            return $this->returnError($response, ['La empresa no posee una configuración de licencias.']);
+        } else {
+            $conf = $conf[0];
+        }
+        $aproveHR = $conf->getAprueba_rrhh();
+
+        $idsol = isset($vars['idsol']) ? intval($vars['idsol']) : 0;
+        $lic = new Licencias($this->collection, $idsol);
+        $aproPri = $lic->getId_aprobador_usuario();
+        $aprobador = isset($aproPri) ? intval($aproPri) : 0;
+        $userDat = new Usuario($this->collection, $aprobador);
+        $idEmpresaUsuario = $userDat->getIdEmpresa();
+        
+        if ($aprobador !== 0) {
+            if ($idEmpresa == $idEmpresaUsuario) {         
+                $obser_sustituto = 'Aprobado en nombre de: '.$userDat->getNombre().' '.$userDat->getApellido();
+                $observation = isset($vars['observation']) ? $vars['observation'].' '.$obser_sustituto : $obser_sustituto;
+            }
+        }        
+        
+        if ($idsol === 0) {
+            return $this->returnError($response, ['Ingrese ID de solicitud.']);
+        }
+        //$lic = new Licencias($this->collection, $idsol);
+        if ($lic->hasErrors()) {
+            return $this->returnError($response, $lic->getErrors());
+        }
+
+        $usrSolicitante = new Usuario($this->collection, $lic->getId_usuario());
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+        $user_approver = isset($vars['user_approver']) ? intval($vars['user_approver']) : 0;
+        if ($user_approver !== 0) {
+            $lpol = new LicenciasPoliticas($this->collection, $usrSolicitante->getId_politica());
+            if (!$lpol->getCambia_aprobador()) {
+                return $this->returnError($response, ['La configuracion no permite solicitar aprobador.']);
+            }
+        }
+
+        $qSol = new LicenciasMovimientos($this->collection);
+        $lastSol = $qSol->buscarPorPropiedades(['id_solicitud' => $idsol], "order by id desc limit 1");
+        if (empty($lastSol)) {
+            return $this->returnError($response, ['No se encuentra la solicitud.']);
+        } else {
+            $lastSol = $lastSol[0];
+        }
+
+        if ($lastSol->getEstado_hasta() > 4) {
+            return $this->returnError($response, ['No se puede realizar la aprobación a la licencia.']);
+        }
+        if ($idUser === $lic->getId_aprobador_usuario()) {
+            if ($lastSol->getEstado_hasta() == 3) {
+                $lic->setId_aprobador_usuario($user->getId());
+                if ($usrSolicitante->getNiveles_aprobacion() === 1) {
+                    $this->cambiarAprobador($user, $lic);
+                }
+                $estadoTo = 4;
+            } elseif ($lastSol->getEstado_hasta() == 2) {
+                $usuarioAprobador = NULL;
+                if ($user_approver != 0) {
+                    $usuarioAprobador = new Usuario($this->collection, $user_approver);
+                    if ($usuarioAprobador->hasErrors()) {
+                        return $this->returnError($response, ['Error al obtener el usuario aprobador']);
+                    }
+
+                    $lic->setId_aprobador_usuario($usuarioAprobador->getId());
+                } elseif ($user_approver == 0) {
+                    $bu = new Usuario($this->collection);
+
+                    if (!empty($user->getNumero_legajo_aprobador())) {
+                        $bu->setLimit(1);
+                        $usuarioAprobador = $bu->buscarPorPropiedades([
+                            'numero_legajo' => $user->getNumero_legajo_aprobador(),
+                            //'es_aprobador' => true, TODO
+                            'idempresa' => $user->getIdEmpresa()
+                        ]);
+                    }
+
+                    if (empty($usuarioAprobador)) {
+                        return $this->returnError($response, ['No se encuentra el usuario aprobador.']);
+                    } else {
+                        $usuarioAprobador = $usuarioAprobador[0];
+                        $lic->setId_aprobador_usuario($usuarioAprobador->getId());
+                    }
+                }
+                $this->cambiarAprobador($user, $lic);
+                $estadoTo = 3;
+            } else {
+                return $this->returnError($response, ['Error al modificar el estado de su licencia. (1)']);
+            }
+        } elseif ($user->getEsRRHH()) {
+            switch ($lastSol->getEstado_hasta()) {
+                case 2:
+                    if ($user_approver != 0) {
+                        $usuarioAprobador = new Usuario($this->collection, $user_approver);
+                        if ($usuarioAprobador->hasErrors()) {
+                            return $this->returnError($response, ['Error al obtener el usuario aprobador']);
+                        }
+                        $lic->setId_aprobador_usuario($usuarioAprobador->getId());
+                    }
+                    $this->cambiarAprobador($user, $lic);
+                    $estadoTo = 3;
+                    break;
+                case 3:
+                    if ($usrSolicitante->getNiveles_aprobacion() === 1) {
+                        $this->cambiarAprobador($user, $lic);
+                    }
+                    $estadoTo = 4;
+                    break;
+                case 4:
+                    $estadoTo = 5;
+                    break;
+            }
+        } elseif ($user->getEsAprobadordeLic() && $lastSol->getEstado_hasta() != 4) {
+            $estadoTo = 4;
+        } else {
+            return $this->returnError($response, ['Error al modificar el estado de su licencia. (2)']);
+        }
+        if ($this->hasErrors()) {
+            $this->returnError($response, $this->getErrors());
+        }
+        switch ($estadoTo) {
+            case 4:
+                $lic->setId_aprobador_usuario(null);
+                break;
+            case 5:
+                $lic->setId_aprobador_usuario(null);
+                break;
+        }
+        $lic->setEstado($estadoTo);
+        $dbconn = $user->getDbconn();
+        $dbconn->comenzarTransaccion();
+        if (($estadoTo == 4 && !$aproveHR) || $estadoTo == 5) {
+            $lc = new LicensesCreator($this->collection);
+            $lc->finalApprove($lic, $usrSolicitante, isset($usuarioAprobador) ? $usuarioAprobador : $user, $conf);
+
+            if ($lc->hasErrors()) {
+                $dbconn->finalizarTransaccion(false);
+                return $this->returnError($response, $lc->getErrors());
+            }
+        }
+
+        $licMov = new LicenciasMovimientos($this->collection);
+        $licMov->setId_solicitud($idsol);
+        $licMov->setEstado_desde($lastSol->getEstado_hasta());
+        $licMov->setEstado_hasta($estadoTo);
+        $licMov->setId_usuario_interviniente($idUser);
+        $licMov->setObservaciones($observation);
+
+        if (!$licMov->save()) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, [$licMov->getErrors()]);
+        }
+
+        if (!$user->cambiarAprobador() || !$lic->save()) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, [$user->getErrors(), $lic->getErrors()]);
+        }
+        //Notifico por mail
+        if (($lastSol->getEstado_hasta() == 2 && $estadoTo == 3) || ($lastSol->getEstado_hasta() == 3 && $estadoTo == 4)) {
+            $lc = new LicensesCreator($this->collection);
+            $lc->sendNotification($lic, $usrSolicitante, $estadoTo, isset($usuarioAprobador) ? $usuarioAprobador : null);
+
+            if ($lc->hasErrors()) {
+                $dbconn->finalizarTransaccion(false);
+                return $this->returnError($response, $lc->getErrors());
+            }
+        }
+
+        $dbconn->finalizarTransaccion(true);
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'La solicitud se aprobó correctamente.',
+            'id' => $licMov->getId()
+        ]);
+    }
+
+    /*
+     * Funcion para cambiar aprobador directo en caso de que la persona seleccione el cambio.
+     */
+    private function cambiarAprobador(Usuario $user, Licencias $lic) {
+        $usrSolicitante = new Usuario($this->collection);
+        $usrSolicitante->setCacheable(false);
+        $usrSolicitante->inicializar($lic->getId_usuario());
+
+        $usrAprobador = new Usuario($this->collection);
+        $usrAprobador->setCacheable(false);
+        $usrAprobador->inicializar($lic->getId_aprobador_usuario());
+
+        if ($usrSolicitante->getNiveles_aprobacion() === 2 && $lic->getEstado() === 2) {
+            return true;
+        }
+
+        if ($usrSolicitante->getNumero_legajo_aprobador() === $usrAprobador->getNumero_legajo()) {
+            return true;
+        }
+        $usrSolicitante->setNumero_legajo_aprobador($usrAprobador->getNumero_legajo());
+
+        if ($usrSolicitante->getNiveles_aprobacion() === 2 && $lic->getEstado() === 3) {
+            return true;
+        }
+        if ($usrSolicitante->getNumero_legajo_aprobador() === $user->getNumero_legajo()) {
+            return true;
+        }
+        $usrSolicitante->setNumero_legajo_aprobador($user->getNumero_legajo());
+
+        if ($usrSolicitante->save() === false) {
+            $this->concatErrors($usrSolicitante);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to obtain information from holidays",
+     *      path = "/licensesAdmin/getStarted",
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function setStart(Request $request, Response $response) {
+        /* @var $r Perfil */
+        /* @var $lpol LicenciasPoliticas */
+        /* @var $ltip LicenciasTipos */
+
+        $user = $this->getRecentUser($request);
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() === false) {
+            return $this->returnError($response, ['No tiene permisos para realizar esta acción']);
+        }
+
+        $idEmp = $user->getEmpresa()->getIdempresa();
+        $nameEmp = $user->getEmpresa()->getNombre();
+        $sle = new LicenciasEmpresas($this->collection);
+        $sle->setLimit(1);
+        $le = $sle->buscarPorPropiedades(['idempresa' => $idEmp]);
+
+        if (!empty($le)) {
+            return $this->returnError($response, ['La empresa seleccionada ya posee el nuevo módulo de licencias.']);
+        }
+
+        if ($user->getHasLicencias()) {
+            return $this->returnError($response, ['La empresa seleccionada ya posee licencias.']);
+        }
+        $dbconn = $user->getDbconn();
+        $dbconn->comenzarTransaccion();
+
+        $plic = new Perfil($this->collection);
+        $plic->setNombre("{$nameEmp} - LICENCIAS");
+        $plic->setEmpresa($user->getEmpresa());
+        $plic->setId_perfil_tipo(Perfil::TIPO_LICENCIAS);
+
+        if ($plic->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            $this->addError('Error al guardar el perfil de licencias.');
+            $this->concatErrors($plic);
+            return $this->returnError($response);
+        }
+
+        $palic1 = new PerfilAccion($this->collection);
+        $palic1->setIdperfil($plic->getId());
+        $palic1->setIdaccion(72);
+        $palic1->setPermiso(true);
+
+        $papro = new Perfil($this->collection);
+        $papro->setNombre("{$nameEmp} - APROBADOR");
+        $papro->setEmpresa($user->getEmpresa());
+        $papro->setId_perfil_tipo(Perfil::TIPO_ESAPROBADOR);
+
+        if ($papro->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, ['Error al guardar el perfil aprobador de licencias.']);
+        }
+
+        $paapro1 = new PerfilAccion($this->collection);
+        $paapro1->setIdperfil($papro->getId());
+        $paapro1->setIdaccion(71);
+        $paapro1->setPermiso(true);
+
+
+        $srrhh = new Perfil($this->collection);
+        $rrhh = $srrhh->buscarPorPropiedades(['idempresa' => $idEmp, 'id_perfil_tipo' => 2]);
+        if (empty($rrhh)) {
+            return $this->returnError($response, ['La empresa no posee perfiles RRHH']);
+        }
+        foreach ($rrhh as $key => $r) {
+            $vPerfil = new PerfilAccion($this->collection);
+            $vP = $vPerfil->buscarPorPropiedades(['idperfil' => $r->getId(), 'idaccion' => 40]);
+            if (!empty($vP)) {
+                $parrhh1 = new PerfilAccion($this->collection);
+                $parrhh1->setIdperfil($r->getId());
+                $parrhh1->setIdaccion(71);
+                $parrhh1->setPermiso(true);
+                $parrhh2 = new PerfilAccion($this->collection);
+                $parrhh2->setIdperfil($r->getId());
+                $parrhh2->setIdaccion(72);
+                $parrhh2->setPermiso(true);
+
+                if (!$parrhh1->save() || !$parrhh2->save()) {
+                    $dbconn->finalizarTransaccion(false);
+                    return $this->returnError($response, ['Error al guardar las acciones.']);
+                }
+            }
+        }
+        if (!$palic1->save() || !$paapro1->save()) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, ['Error al guardar las acciones.']);
+        }
+
+
+        $lemp = new LicenciasEmpresas($this->collection);
+        $lemp->setIdempresa($idEmp);
+        $lemp->setShow_detail(false);
+        $lemp->setShow_balance(true);
+        $lemp->setPeriodo_liquidacion(false);
+        $lemp->setAprueba_rrhh(true);
+
+        if ($lemp->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, ['Error al guardar configuracion de empresa de licencias por defecto.']);
+        }
+
+
+        $lpol = new LicenciasPoliticas($this->collection);
+        $lpol->setIdempresa($idEmp);
+        $lpol->setCodigo('DFL');
+        $lpol->setNombre('Defecto');
+        $lpol->setDescripcion('Politica configurada por defecto');
+        $lpol->setIs_default(true);
+        $lpol->setCambia_aprobador(true);
+        $lpol->setPuede_solicitar(true);
+
+        if ($lpol->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, ['Error al guardar la politica de licencias por defecto.']);
+        }
+
+
+        $ltip = new LicenciasTipos($this->collection);
+        $ltip->setId_empresa($idEmp);
+        $ltip->setNombre('Vacaciones');
+        $ltip->setAlias("VACACIONES - {$nameEmp}");
+        $ltip->setVisible(true);
+        $ltip->setTiene_subtipos(false);
+
+        if ($ltip->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, ['Error al guardar el tipo de licencias por defecto.']);
+        }
+
+        $lpr = new LicenciasPoliticasReglas($this->collection);
+        $lpr->setId_politica($lpol->getId());
+        $lpr->setId_licencia_tipo($ltip->getId());
+        $lpr->setId_regla(Manager::BALANCE_RULES);
+        $lpr->setParams('{"years":"asc"}');
+
+        if ($lpr->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, ['Error al guardar la configuracion de licencias por defecto.']);
+        }
+
+        $lpr1 = new LicenciasPoliticasReglas($this->collection);
+        $lpr1->setId_politica($lpol->getId());
+        $lpr1->setId_licencia_tipo($ltip->getId());
+        $lpr1->setId_regla(Manager::SHOWBALANCE_RULES);
+
+        if ($lpr1->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, ['Error al guardar la configuracion de licencias por defecto.']);
+        }
+
+
+        $dbconn->finalizarTransaccion(true);
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'La configuracion de licencias inicial finalizo correctamente'
+        ]);
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to obtain information from holidays",
+     *      path = "/licensesAdmin/holidayParams",
+     *      @SWG\Parameter(
+     *          name = "idp",
+     *          description = "policy ID para empleados de RRHH o Admin, usuarios comunes deben dejar el capmo vacio",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "fecha_desde",
+     *          description = "date from which you are looking for holidays",
+     *          type = "string",
+     *          format = "date",
+     *          default = "DD/MM/YYYY",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "fecha_hasta",
+     *          description = "date to which you are looking for holidays",
+     *          type = "string",
+     *          format = "date",
+     *          default = "DD/MM/YYYY",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function getHolidayParams(Request $request, Response $response) {
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        $vars = $request->getParsedBody();
+
+        if (isset($vars['fecha_desde']) && !empty($vars['fecha_desde'])) {
+            $valid = Date::checkFormat($vars['fecha_desde']);
+            if ($valid === false) {
+                return $this->returnError($response, ['Fromato incorrecto.']);
+            }
+            $fecha_desde = Date::createFromString($vars['fecha_desde']);
+        } else {
+            $fecha_desde = null;
+        }
+
+        if (isset($vars['fecha_hasta']) && !empty($vars['fecha_hasta'])) {
+            $valid = Date::checkFormat($vars['fecha_hasta']);
+            if ($valid === false) {
+                return $this->returnError($response, ['Fromato incorrecto.']);
+            }
+            $fecha_hasta = Date::createFromString($vars['fecha_hasta']);
+        } else {
+            $fecha_hasta = null;
+        }
+        $feriados = [];
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false && $user->getEsAprobadordeLic() == false) {
+            $policyId = intval($user->getId_politica());
+        } else {
+            $policyId = array_key_exists('idp', $vars) ? intval($vars['idp']) : null;
+        }
+        $lf = new LicenciasFeriados($this->collection);
+        $regs = $lf->setHollidays($user);
+
+        if ($fecha_desde === null && $fecha_hasta === null) {
+            $feriados = $regs[0];
+        } elseif ($fecha_desde === null || $fecha_hasta === null) {
+            return $this->returnError($response, ['Debe completar ambos capos de fecha.']);
+        } elseif ($fecha_hasta->diff($fecha_desde)->invert === 0 && $fecha_desde != $fecha_hasta) {
+            return $this->returnError($response, ['El intervalo de tiempo debe ser positivo.']);
+        } else {
+
+            foreach ($regs[0] as $key => $value) {
+                if (Date::createFromString($value['fecha']) >= $fecha_desde && Date::createFromString($value['fecha']) <= $fecha_hasta) {
+                    if (isset($policyId) && $policyId == intval($value['id_politica'])) {
+                        $feriados[$key] = $value;
+                    } else {
+                        if ($value['id_politica'] === null || $user->getAdmin()) {
+                            $feriados[$key] = $value;
+                        }
+                    }
+                }
+            }
+        }
+
+        $p = new PaginationRequest($request);
+
+        $total = 0;
+        if (!empty($feriados)) {
+            $total = count($feriados);
+        }
+
+        if (!empty($feriados)) {
+            $feriados = array_chunk($feriados, $p->getLimit())[$p->getCurrentPage() - 1];
+        }
+
+        $jp = new JsonPagination($feriados);
+        $jp->setPaginationRequest($p);
+        $jp->setTotal($total);
+        $j = new JsonResponse();
+        return $j->renderWithPagination($request, $response, $jp);
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      consumes = {"application/x-www-form-urlencoded"},
+     *      summary = "this endpoint allow to create a holiday.",
+     *      path = "/licensesAdmin/holidayCreate",
+     *      consumes = {"application/x-www-form-urlencoded"},
+     *      @SWG\Parameter(
+     *          name = "id_politica",
+     *          description = "policy ID",
+     *          type = "integer",
+     *          format = "int64",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "id_empresa",
+     *          description = "empresa ID",
+     *          type = "integer",
+     *          format = "int64",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "pais",
+     *          description = "country inicials ej:('AR','UY','CL')",
+     *          default = null,
+     *          type = "string",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "fecha",
+     *          description = "holiday's date",
+     *          type = "string",
+     *          default = "DD/MM/YYYY",
+     *          format = "date",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "detalle",
+     *          description = "holiday detail / holiday name",
+     *          type = "string",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     *
+     */
+    public function createHoliday(Request $request, Response $response) {
+        $user = $this->getRecentUser($request);
+        $redis = DBRedis::getClientByCollection($this->collection);
+        $master = $redis->getMaster();
+        $slave = $redis->getSlave();
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos para crear notificaciones.']);
+        }
+
+        $vars = $request->getParsedBody();
+
+        $toValid = [
+            'fecha' => 'No se ha definido fecha.',
+            'detalle' => 'No se ha definido el detalle.',
+        ];
+
+        if ($this->hasEmptyVariables($vars, $toValid)) {
+            return $this->returnError($response);
+        }
+
+        if (isset($vars['fecha'])) {
+            $valid = Date::checkFormat($vars['fecha']);
+            if ($valid === false) {
+                return $this->returnError($response, ['Fromato incorrecto.']);
+            }
+        }
+
+
+        $id_politica = isset($vars['id_politica']) ? intval($vars['id_politica']) : null;
+
+        if ($user->getAdmin()) {
+            if (isset($vars['id_empresa'])) {
+                $id_empresa = intval($vars['id_empresa']);
+            } else {
+                $id_empresa = $user->getEmpresa()->getIdempresa();
+            }
+        } else {
+            $id_empresa = $user->getEmpresa()->getIdempresa();
+        }
+        if (isset($vars['pais'])) {
+            if ($user->getAdmin() == false) {
+                return $this->returnError($response, ['No tiene permisos para crear un feriado por pais']);
+            }
+            $validPais = new Pais($this->collection, $vars['pais']);
+            if ($validPais->hasErrors()) {
+                return $this->returnError($response, ['El pais seleccionado no existe']);
+            }
+            $id_empresa = null;
+            $pais = $vars['pais'];
+        } else {
+            $pais = '';
+        }
+
+        if (!(!empty($id_politica) || !empty($id_empresa) || !empty($pais))) {
+            return $this->returnError($response, ['Debe seleccionar uno de los campos (politica/empresa/pais)']);
+        }
+        $feriado = new LicenciasFeriados($this->collection);
+
+        $feriado->setId_politica($id_politica);
+        $feriado->setId_empresa($id_empresa);
+        $feriado->setPais($pais);
+        $feriado->setFecha($vars['fecha']);
+        $feriado->setDetalle($vars['detalle']);
+
+        if (($feriado->getId_empresa() === $user->getEmpresa()->getIdempresa()) || $user->getAdmin()) {
+            $feriado->save();
+        }
+
+        if ($feriado->hasErrors()) {
+            return $this->returnError($response, $feriado->getErrors());
+        }
+
+        if (empty($feriado->getId_empresa())) {
+            $this->deleteCache();
+
+        } else if ($slave->exists(LicenciasFeriados::PREFIX . $id_empresa) == 1) {
+            $master = $redis->getMaster();
+            $master->del(LicenciasFeriados::PREFIX . $id_empresa);
+        }
+        $j = new JsonResponse();
+        $j->setType('string');
+        return $j->render($response, [
+            'message' => 'El dia no laborable se ha creado correctamente.',
+            'id' => $feriado->getId()
+        ]);
+    }
+
+    /**
+     * Delete all cache key from holidays
+     */
+    private function deleteCache() {
+        $redis = DBRedis::getClientByCollection($this->collection);
+        $slave = $redis->getSlave();
+        $master = $redis->getMaster();
+
+        foreach ($slave->keys(LicenciasFeriados::PREFIX . '*') as $key) {
+            $master->del(strstr($key,LicenciasFeriados::PREFIX));
+        }
+    }
+
+    /**
+     * @SWG\Delete(
+     *      tags = {"Licenses Managers"},
+     *      summary = "This endpoint deletes a holiday",
+     *      path = "/licensesAdmin/holiday/{id}",
+     *      @SWG\Parameter(
+     *          name = "id",
+     *          description = "Holiday ID",
+     *          default = 0,
+     *          type = "integer",
+     *          format = "int64",
+     *          in = "path",
+     *          required = true
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function deleteHoliday(Request $request, Response $response, $args = []) {
+        $user = $this->getRecentUser($request);
+        $redis = DBRedis::getClientByCollection($this->collection);
+        $slave = $redis->getSlave();
+        $master = $redis->getMaster();
+        $id_empresa = $user->getEmpresa()->getIdempresa();
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos para eliminar feriados.']);
+        }
+
+        $id = isset($args['id']) ? intval($args['id']) : 0;
+        if (empty($id)) {
+            return $this->returnError($response, ['Defina el ID de feriado.']);
+        }
+        $feriado = new LicenciasFeriados($this->collection, $id);
+
+        if ($feriado->hasErrors()) {
+            return $this->returnError($response, $feriado->getErrors());
+        }
+
+        if (($feriado->getId_empresa() === $user->getEmpresa()->getIdempresa()) || $user->getAdmin()) {
+            $feriado->eliminar();
+        } else {
+            return $this->returnError($response, ['No puede eliminar el feriado seleccionado.']);
+        }
+
+        if ($feriado->hasErrors()) {
+            return $this->returnError($response, $feriado->getErrors());
+        }
+
+        if ($user->getAdmin()) {
+            $this->deleteCache();
+        }
+
+        if ($slave->exists(LicenciasFeriados::PREFIX . $id_empresa) == 1) {
+            $master->del(LicenciasFeriados::PREFIX . $id_empresa);
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, ['El feriado fue eliminado exitosamente']);
+    }
+
+    /**
+     * @SWG\Put(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to update settings information from company",
+     *      path = "/licensesAdmin/settings",
+     *      consumes = {"application/x-www-form-urlencoded"},
+     *      @SWG\Parameter(
+     *          name = "show_detail",
+     *          description = "Muestra el detalle de saldos en la pantalla de solicitud de licencia",
+     *          default = 0,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "show_balance",
+     *          description = "Muestra la cantidad de dias disponibles en la pantalla de solicitud",
+     *          default = 0,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "periodo_liquidacion",
+     *          description = "",
+     *          default = 0,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "aprueba_rrhh",
+     *          description = "Permit aprove human resources",
+     *          default = 0,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "id_categoria_tipo_documento",
+     *          description = "ID de categoria tipo documento",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "notificacion",
+     *          description = "notification",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function configSettings(Request $request, Response $response) {
+        /* @var $ll LicenciasEmpresas */
+        /* @var $lt LicenciasTipos */
+
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos crear una configuracion de licencias.']);
+        }
+
+        $ide = $user->getEmpresa()->getIdempresa();
+
+        $vars = $request->getParsedBody();
+
+        if (!empty($vars['id_categoria_tipo_documento']) && empty($vars['notificacion']) || empty($vars['id_categoria_tipo_documento']) && !empty($vars['notificacion'])) {
+            return $this->returnError($response, ['Debe completar ambos campos']);
+        }
+
+        $slt = new LicenciasTipos($this->collection);
+        $lt = $slt->buscarPorPropiedades(['id_empresa'=>$ide, 'send_document'=>true]);
+        if (empty($vars['id_categoria_tipo_documento']) && !empty($lt)) {
+            return $this->returnError($response, ['No se puede aplicar la configuracion.']);
+        }
+        $licenciasEmpresas = new LicenciasEmpresas($this->collection);
+        $l = $licenciasEmpresas->buscarPorPropiedades(['idempresa' => $ide]);
+
+        if (empty($l)) {
+            $ll = new LicenciasEmpresas($this->collection);
+        } else {
+            $ll = $l[0];
+        }
+
+        $ll->setIdempresa($ide);
+        if (isset($vars['show_detail'])) {
+            $ll->setShow_detail($vars['show_detail'] == 1);
+        }
+
+        if (isset($vars['show_balance'])) {
+            $ll->setShow_balance($vars['show_balance'] == 1);
+        }
+
+        if (isset($vars['periodo_liquidacion'])) {
+            $ll->setPeriodo_liquidacion($vars['periodo_liquidacion'] == 1);
+        }
+
+        if (isset($vars['aprueba_rrhh'])) {
+            $ll->setAprueba_rrhh($vars['aprueba_rrhh'] == 1);
+        }
+
+        if (isset($vars['id_categoria_tipo_documento'])) {
+            $ll->setId_categoria_tipo_documento($vars['id_categoria_tipo_documento']);
+        }
+
+        if (isset($vars['notificacion'])) {
+            $ll->setNotificacion($vars['notificacion']);
+        }
+
+        $ll->save();
+
+        if ($ll->hasErrors()) {
+            return $this->returnError($response, $ll->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, ['Se actualizó la configuración de licencia por empresa']);
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to create a policy for a company",
+     *      path = "/licensesAdmin/policy",
+     *      @SWG\Parameter(
+     *          name = "codigo",
+     *          description = "Code",
+     *          type = "string",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "nombre",
+     *          description = "Name",
+     *          type = "string",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "description",
+     *          description = "Description",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *     @SWG\Parameter(
+     *          name = "cambia_aprobador",
+     *          description = "change approver",
+     *          default = 1,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *     @SWG\Parameter(
+     *          name = "puede_solicitar",
+     *          description = "can apply",
+     *          default = 1,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function createPolicy(Request $request, Response $response) {
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos para crear configuraciones de empresa.']);
+        }
+
+
+        $id_empresa = $user->getEmpresa()->getIdempresa();
+
+        $vars = $request->getParsedBody();
+
+        $toValid = [
+            'codigo' => 'Ingrese codigo la politica.',
+            'nombre' => 'Ingrese nombre la politica.',
+        ];
+
+        if ($this->hasEmptyVariables($vars, $toValid)) {
+            return $this->returnError($response);
+        }
+
+        $codigo = isset($vars['codigo']) ? $vars['codigo'] : '';
+        if (!ctype_alnum($codigo) || strlen($codigo) > 5) {
+            return $this->returnError($response, ['El campo codigo debe tener al menos no mas de 5 caracteres alfanumericos.']);
+        }
+
+        $search = new LicenciasPoliticas($this->collection);
+        $lp = $search->buscarPorPropiedades(['codigo' => $codigo, 'idempresa' => $id_empresa]);
+        if (!empty($lp)) {
+            return $this->returnError($response, ['El código de política ya existe.']);
+        }
+
+        $nombre = isset($vars['nombre']) ? $vars['nombre'] : false;
+        $description = isset($vars['description']) ? $vars['description'] : false;
+        $cambia_aprobador = isset($vars['cambia_aprobador']) ? $vars['cambia_aprobador'] == 1 : false;
+        $puede_solicitar = isset($vars['puede_solicitar']) ? $vars['puede_solicitar'] == 1 : false;
+
+        $licenciasPoliticas = new LicenciasPoliticas($this->collection);
+        $licenciasPoliticas->setIdempresa($id_empresa);
+        $licenciasPoliticas->setCodigo($codigo);
+        $licenciasPoliticas->setNombre($nombre);
+        $licenciasPoliticas->setDescripcion($description);
+        $licenciasPoliticas->setCambia_aprobador($cambia_aprobador);
+        $licenciasPoliticas->setPuede_solicitar($puede_solicitar);
+
+        $licenciasPoliticas->save();
+        if ($licenciasPoliticas->hasErrors()) {
+            return $this->returnError($response, $licenciasPoliticas->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'La politica fue creada exitosamente',
+            'id' => $licenciasPoliticas->getId()
+        ]);
+    }
+
+    /**
+     * @SWG\Put(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to obtain a specific policy",
+     *      path = "/licensesAdmin/policy/{idp}",
+     *      consumes = {"application/x-www-form-urlencoded"},
+     *      @SWG\Parameter(
+     *          name = "idp",
+     *          description = "licences type ID",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "path"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "codigo",
+     *          description = "Code",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "nombre",
+     *          description = "Name",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "description",
+     *          description = "Description",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *     @SWG\Parameter(
+     *          name = "cambia_aprobador",
+     *          description = "change approver",
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *     @SWG\Parameter(
+     *          name = "puede_solicitar",
+     *          description = "can apply",
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function updatePolicy(Request $request, Response $response, $args = []) {
+        /* @var $lp LicenciasPoliticas */
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+        $id = isset($args['idp']) ? intval($args['idp']) : 0;
+        $id_empresa = $user->getEmpresa()->getIdempresa();
+        $vars = $request->getParsedBody();
+        $licenciasPoliticas = new LicenciasPoliticas($this->collection, $id);
+        if ($licenciasPoliticas->hasErrors()) {
+            return $this->returnError($response, $licenciasPoliticas->getErrors());
+        }
+
+        if (isset($vars['codigo'])) {
+            $slp = new LicenciasPoliticas($this->collection);
+            $lp = $slp->buscarPorPropiedades(['codigo' => $vars['codigo'], 'idempresa' => $id_empresa]);
+            if (empty($lp)) {
+                $licenciasPoliticas->setCodigo($vars['codigo']);
+            } else {
+                $lp = $lp[0];
+                if ($id != $lp->getId()) {
+                    return $this->returnError($response, ['Ya existe una política con ese código en la empresa.']);
+                }
+            }
+        }
+
+
+        if (isset($vars['nombre'])) {
+            $licenciasPoliticas->setNombre($vars['nombre']);
+        }
+
+        if (isset($vars['description'])) {
+            $licenciasPoliticas->setDescripcion($vars['description']);
+        }
+
+        if (isset($vars['cambia_aprobador'])) {
+            $licenciasPoliticas->setCambia_aprobador($vars['cambia_aprobador'] == 1);
+        }
+
+        if (isset($vars['puede_solicitar'])) {
+            $licenciasPoliticas->setPuede_solicitar($vars['puede_solicitar'] == 1);
+        }
+        $licenciasPoliticas->save();
+        if ($licenciasPoliticas->hasErrors()) {
+            return $this->returnError($response, $licenciasPoliticas->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'La politica fue actualizada exitosamente',
+            'id' => $licenciasPoliticas->getId()
+        ]);
+
+
+    }
+
+    /**
+     * @SWG\Delete(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to delete a specific policy",
+     *      path = "/licensesAdmin/policy/{idp}",
+     *      @SWG\Parameter(
+     *          name = "idp",
+     *          description = "licences type ID",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "path"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function deletePolicy(Request $request, Response $response, $args = []) {
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos para eliminar la politica.']);
+        }
+
+        $id = isset($args['idp']) ? intval($args['idp']) : 0;
+        if (empty($id)) {
+            return $this->returnError($response, ['Defina el ID de la politica.']);
+        }
+
+        $licenciasPoliticas = new LicenciasPoliticas($this->collection, $id);
+
+        if ($licenciasPoliticas->hasErrors()) {
+            return $this->returnError($response, $licenciasPoliticas->getErrors());
+        }
+
+        if ($licenciasPoliticas->getIdempresa() !== $user->getEmpresa()->getIdempresa()) {
+            return $this->returnError($response, ['La politica debe ser de la misma empresa que el usuario.']);
+        }
+
+        $licenciasPoliticas->eliminar();
+
+        if ($licenciasPoliticas->hasErrors()) {
+            return $this->returnError($response, ['La licencia politica de empresa no existe o es erronea']);
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, ['La politica fue eliminada exitosamente']);
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to create a licenses type for a specific policy",
+     *      path = "/licensesAdmin/types",
+     *      @SWG\Parameter(
+     *          name = "nombre",
+     *          description = "Licences name",
+     *          type = "string",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "alias",
+     *          description = "Licenses alias",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "visible",
+     *          description = "Visible property",
+     *          default = 1,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData",
+     *          required = false
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "send_document",
+     *          description = "Enviar Documento",
+     *          default = 1,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData",
+     *          required = false
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function createType(Request $request, Response $response) {
+
+
+        /* @var $p LicenciasPoliticas */
+
+        /* @var $conf LicenciasEmpresas */
+        $user = $this->getRecentUser($request);
+
+        $id_empresa = $user->getEmpresa()->getIdempresa();
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        $vars = $request->getParsedBody();
+
+        $toValid = [
+            'nombre' => 'Ingrese nombre del tipo de licencia.',
+        ];
+
+        if ($this->hasEmptyVariables($vars, $toValid)) {
+            return $this->returnError($response);
+        }
+
+        $nombre = isset($vars['nombre']) ? $vars['nombre'] : '';
+        $alias = isset($vars['alias']) ? $vars['alias'] : '';
+        $visible = isset($vars['visible']) ? $vars['visible'] == 1 : false;
+        $send_document = isset($vars['send_document']) ? $vars['send_document'] == 1 : false;
+
+        $searchType = new LicenciasTipos($this->collection);
+        $type = $searchType->buscarPorPropiedades(['nombre' => trim($nombre), 'id_empresa' => $id_empresa]);
+
+        if (!empty($type)) {
+            return $this->returnError($response, ['Ya existe un tipo de licencia con ese nombre']);
+        }
+
+        $licenciasTipos = new LicenciasTipos($this->collection);
+        $licenciasTipos->setNombre($nombre);
+        $licenciasTipos->setAlias($alias);
+        $licenciasTipos->setVisible($visible);
+        $licenciasTipos->setId_empresa($id_empresa);
+        $licenciasTipos->setTiene_subtipos(true);
+
+        if ($send_document) {
+            $sCconf = new LicenciasEmpresas($this->collection);
+            $conf = $sCconf->buscarPorPropiedades(['idempresa' => $id_empresa]);
+            if (empty($conf)) {
+                return $this->returnError($response, ['La empresa no posee una configuración de licencias.']);
+            } else {
+                $conf = $conf[0];
+            }
+            if (!empty($conf->getId_categoria_tipo_documento())) {
+                $licenciasTipos->setSendDocument($send_document);
+            } else {
+                return $this->returnError($response, ['No se puede modificar el atributo.']);
+            }
+        }
+        $licenciasTipos->save();
+        if ($licenciasTipos->hasErrors()) {
+            return $this->returnError($response, $licenciasTipos->getErrors());
+        }
+
+        $licenciasSubtipos = new LicenciasSubtipo($this->collection);
+        $licenciasSubtipos->setNombre($nombre);
+        $licenciasSubtipos->setAlias($alias);
+        $licenciasSubtipos->setId_padre($licenciasTipos->getId());
+        $licenciasSubtipos->save();
+        if ($licenciasSubtipos->hasErrors()) {
+            return $this->returnError($response, $licenciasSubtipos->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'El tipo fue creado exitosamente.',
+            'id' => $licenciasTipos->getId()
+        ]);
+    }
+
+    /**
+     * @SWG\Put(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to update a holiday type for a specific policy",
+     *      path = "/licensesAdmin/types/{idtype}",
+     *      consumes = {"application/x-www-form-urlencoded"},
+     *      @SWG\Parameter(
+     *          name = "idtype",
+     *          description = "licences type ID",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "path"
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "nombre",
+     *          description = "Licences name",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "alias",
+     *          description = "Licenses alias",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "visible",
+     *          description = "Visible property",
+     *          default = 1,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "send_document",
+     *          description = "Enviar Documento",
+     *          default = 1,
+     *          enum = {1,0},
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData",
+     *          required = false
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function updateType(Request $request, Response $response, $args = []) {
+        /* @var $type LicenciasTipos */
+        $user = $this->getRecentUser($request);
+        $id_empresa = $user->getEmpresa()->getIdempresa();
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        $id = isset($args['idtype']) ? intval($args['idtype']) : 0;
+
+        $vars = $request->getParsedBody();
+        $toValid = [
+            'nombre' => 'Ingrese nombre del tipo de licencia.',
+        ];
+
+        if ($this->hasEmptyVariables($vars, $toValid)) {
+            return $this->returnError($response);
+        }
+
+        $licenciasTipos = new LicenciasTipos($this->collection, $id);
+
+        if ($licenciasTipos->hasErrors()) {
+            return $this->returnError($response, $licenciasTipos->getErrors());
+        }
+
+        if (isset($vars['nombre'])) {
+            $licenciasTipos->setNombre($vars['nombre']);
+        }
+
+        $searchType = new LicenciasTipos($this->collection);
+        $type = $searchType->buscarPorPropiedades(['nombre' => trim($vars['nombre']), 'id_empresa' => $id_empresa]);
+        if (!empty($type)) {
+            $type = $type[0];
+            if ($id != $type->getId()) {
+                return $this->returnError($response, ['Ya existe un tipo de licencia con ese nombre']);
+            }
+        }
+
+        if (isset($vars['alias'])) {
+            $licenciasTipos->setAlias($vars['alias']);
+        }
+
+        if (isset($vars['visible'])) {
+            $licenciasTipos->setVisible($vars['visible'] == 1);
+        }
+
+        if (isset($vars['send_document'])) {
+            if ($vars['send_document']) {
+                $sCconf = new LicenciasEmpresas($this->collection);
+                $conf = $sCconf->buscarPorPropiedades(['idempresa' => $id_empresa]);
+                if (empty($conf)) {
+                    return $this->returnError($response, ['La empresa no posee una configuración de licencias.']);
+                } else {
+                    $conf = $conf[0];
+                }
+                if (!empty($conf->getId_categoria_tipo_documento())) {
+                    $licenciasTipos->setSendDocument($vars['send_document']);
+                } else {
+                    return $this->returnError($response, ['No se puede modificar el atributo.']);
+                }
+            } else {
+                $licenciasTipos->setSendDocument($vars['send_document']);
+            }
+        }
+
+        $licenciasTipos->save();
+        if ($licenciasTipos->hasErrors()) {
+            return $this->returnError($response, $licenciasTipos->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'El tipo fue actualizado exitosamente',
+            'id' => $licenciasTipos->getId()
+        ]);
+
+    }
+
+    /**
+     * @SWG\Delete(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to delete a licenses type for a specific policy",
+     *      path = "/licensesAdmin/types/{idtype}",
+     *      @SWG\Parameter(
+     *          name = "idtype",
+     *          description = "licences type ID",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "path"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function deleteType(Request $request, Response $response, $args = []) {
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos para eliminar tipos de licencias.']);
+        }
+
+        $id = isset($args['idtype']) ? intval($args['idtype']) : 0;
+        if (empty($id)) {
+            return $this->returnError($response, ['Defina el ID del tipo.']);
+        }
+
+        $licenciasTipos = new LicenciasTipos($this->collection, $id);
+
+        if ($licenciasTipos->hasErrors()) {
+            return $this->returnError($response, $licenciasTipos->getErrors());
+        }
+
+        $licenciasTipos->eliminar();
+
+        if ($licenciasTipos->hasErrors()) {
+            return $this->returnError($response, $licenciasTipos->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, ['El tipo de licencia fue eliminado exitosamente']);
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to create a holiday subtype for a specific policy",
+     *      path = "/licensesAdmin/subtypes",
+     *      @SWG\Parameter(
+     *          name = "nombre",
+     *          description = "Sub-type name",
+     *          type = "string",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "alias",
+     *          description = "Sub-type description",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "id_padre",
+     *          description = "ID from licenses type",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function createSubtype(Request $request, Response $response) {
+        /* @var $l LicenciasPoliticasReglas */
+        $user = $this->getRecentUser($request);
+        if ($user->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        $vars = $request->getParsedBody();
+
+        $toValid = [
+            'nombre' => 'Ingrese nombre del subtipo de licencia.',
+            'id_padre' => 'Ingrese id del tipo.',
+        ];
+
+        if ($this->hasEmptyVariables($vars, $toValid)) {
+            return $this->returnError($response);
+        }
+
+        $nombre = isset($vars['nombre']) ? $vars['nombre'] : '';
+        $alias = isset($vars['alias']) ? $vars['alias'] : '';
+        $id_padre = isset($vars['id_padre']) ? intval($vars['id_padre']) : 0;
+        $dbconn = $user->getDbconn();
+        $dbconn->comenzarTransaccion();
+        $licenciasSubtipo = new LicenciasSubtipo($this->collection);
+        $licenciasSubtipo->setNombre($nombre);
+        $licenciasSubtipo->setAlias($alias);
+        $licenciasSubtipo->setId_padre($id_padre);
+
+        $licenciasTipo = new LicenciasTipos($this->collection, $id_padre);
+        $licenciasTipo->setTiene_subtipos(true);
+        if ($licenciasTipo->save() === false || $licenciasSubtipo->save() === false) {
+            $dbconn->finalizarTransaccion(false);
+            return $this->returnError($response, array_merge($licenciasTipo->getErrors()), $licenciasSubtipo->getErrors());
+        }
+
+        $slpr = new LicenciasPoliticasReglas($this->collection);
+        $lpr = $slpr->buscarPorPropiedades(['id_licencia_tipo' => $id_padre, 'id_regla' => Manager::BALANCE_RULES]);
+        foreach ($lpr as $i => $l) {
+            $param = $l->getParams();
+            $paramAux = [];
+            if (isset($param['subtype'])) {
+                $param['subtype'][] = $licenciasSubtipo->getId();
+            }
+            $l->setParams(json_encode($param, JSON_FORCE_OBJECT));
+            if ($l->save() === false) {
+                $dbconn->finalizarTransaccion(false);
+                return $this->returnError($response, $l->getErrors());
+            }
+        }
+        $dbconn->finalizarTransaccion(true);
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'El Subtipo fue creado exitosamente.',
+            'id' => $licenciasSubtipo->getId()
+        ]);
+    }
+
+    /**
+     * @SWG\Put(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to update a licenses subtype for a specific policy",
+     *      path = "/licensesAdmin/subtypes/{idstype}",
+     *      consumes = {"application/x-www-form-urlencoded"},
+     *      @SWG\Parameter(
+     *          name = "idstype",
+     *          description = "Sub-type ID",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "path"
+     *      ),@SWG\Parameter(
+     *          name = "nombre",
+     *          description = "Sub-type name",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "alias",
+     *          description = "Sub-type description",
+     *          type = "string",
+     *          in = "formData",
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "id_padre",
+     *          description = "ID from licenses type",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function updateSubtype(Request $request, Response $response, $args = []) {
+        $user = $this->getRecentUser($request);
+
+        if ($user->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        $id = isset($args['idstype']) ? intval($args['idstype']) : 0;
+
+        $vars = $request->getParsedBody();
+        $licenciasSubtipos = new LicenciasSubtipo($this->collection, $id);
+
+        if ($licenciasSubtipos->hasErrors()) {
+            return $this->returnError($response, $licenciasSubtipos->getErrors());
+        }
+
+        if (isset($vars['nombre'])) {
+            $licenciasSubtipos->setNombre($vars['nombre']);
+        }
+
+        if (isset($vars['alias'])) {
+            $licenciasSubtipos->setAlias($vars['alias']);
+        }
+
+        if (isset($vars['id_padre'])) {
+            $licenciasSubtipos->setId_padre(intval($vars['id_padre']));
+        }
+
+        $licenciasSubtipos->save();
+        if ($licenciasSubtipos->hasErrors()) {
+            return $this->returnError($response, $licenciasSubtipos->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, ['El Subtipo fue actualizado exitosamente']);
+    }
+
+    /**
+     * @SWG\Delete(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to delete a licenses subtype for a specific policy",
+     *      path = "/licensesAdmin/subtypes/{idstype}",
+     *      @SWG\Parameter(
+     *          name = "idstype",
+     *          description = "licences type ID",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "path"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function deleteSubtype(Request $request, Response $response, $args = []) {
+        $user = $this->getRecentUser($request);
+
+        if ($user->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos para eliminar tipos de licencias.']);
+        }
+
+        $id = isset($args['idstype']) ? intval($args['idstype']) : 0;
+        if (empty($id)) {
+            return $this->returnError($response, ['Defina el ID del subtipo.']);
+        }
+
+        $licenciasSubtipos = new LicenciasSubtipo($this->collection, $id);
+
+        if ($licenciasSubtipos->hasErrors()) {
+            return $this->returnError($response, $licenciasSubtipos->getErrors());
+        }
+        $id_padre = $licenciasSubtipos->getId_padre();
+
+        $licenciasSubtipos->eliminar();
+
+        if ($licenciasSubtipos->hasErrors()) {
+            return $this->returnError($response, $licenciasSubtipos->getErrors());
+        }
+
+        $ls = new LicenciasSubtipo($this->collection);
+        $cantidad = $ls->buscarPorPropiedades(['id_padre' => $id_padre]);
+
+        if (empty($cantidad)) {
+            $lt = new LicenciasTipos($this->collection, $id_padre);
+            $lt->setTiene_subtipos(false);
+            $lt->save();
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, ['El tipo de licencia fue eliminado exitosamente']);
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to create a policy for a company",
+     *      path = "/licensesAdmin/policyrules",
+     *      @SWG\Parameter(
+     *          name = "idp",
+     *          description = "ID de politica",
+     *          type = "integer",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "idt",
+     *          description = "ID de tipo de licencia",
+     *          type = "integer",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "idr",
+     *          description = "ID de regla",
+     *          type = "integer",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *     @SWG\Parameter(
+     *          name = "params",
+     *          description = "parametros custom de la regla",
+     *          type = "string",
+     *          in = "formData"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function createPolicyRules(Request $request, Response $response) {
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        $vars = $request->getParsedBody();
+
+        $idp = isset($vars['idp']) ? $vars['idp'] : 0;
+        $idt = isset($vars['idt']) ? $vars['idt'] : 0;
+        $idr = isset($vars['idr']) ? $vars['idr'] : 0;
+        $params = isset($vars['params']) ? $vars['params'] : '';
+
+        $licenciasPoliticasReglas = new LicenciasPoliticasReglas($this->collection);
+        $licenciasPoliticasReglas->setId_politica($idp);
+        $licenciasPoliticasReglas->setId_licencia_tipo($idt);
+        $licenciasPoliticasReglas->setId_regla($idr);
+        $licenciasPoliticasReglas->setParams($params);
+
+        $licenciasPoliticasReglas->save();
+        if ($licenciasPoliticasReglas->hasErrors()) {
+            return $this->returnError($response, $licenciasPoliticasReglas->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, [
+            'message' => 'La politica fue creada exitosamente',
+            'id' => $licenciasPoliticasReglas->getId()
+        ]);
+    }
+
+    /**
+     * @SWG\Delete(
+     *      tags = {"Licenses Managers"},
+     *      summary = "this endpoint allow to delete a specific policy",
+     *      path = "/licensesAdmin/policyrules/{id}",
+     *      @SWG\Parameter(
+     *          name = "id",
+     *          description = "licences type ID",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "path"
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function deletePolicyRules(Request $request, Response $response, $args = []) {
+        $user = $this->getRecentUser($request);
+
+        if ($this->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        if ($user->getAdmin() == false && $user->getEsRRHH() == false) {
+            return $this->returnError($response, ['No posee permisos para eliminar la regla.']);
+        }
+
+        $id = isset($args['id']) ? intval($args['id']) : 0;
+        if (empty($id)) {
+            return $this->returnError($response, ['Defina el ID de la regla']);
+        }
+
+        $licenciasPoliticasReglas = new LicenciasPoliticasReglas($this->collection, $id);
+
+        if ($licenciasPoliticasReglas->hasErrors()) {
+            return $this->returnError($response, $licenciasPoliticasReglas->getErrors());
+        }
+
+        $licenciasPoliticasReglas->eliminar();
+
+        if ($licenciasPoliticasReglas->hasErrors()) {
+            return $this->returnError($response, $licenciasPoliticasReglas->getErrors());
+        }
+
+        $j = new JsonResponse();
+        return $j->render($response, ['La politica fue eliminada exitosamente']);
+    }
+
+    /**
+     * @SWG\Post(
+     *      tags = {"Licenses Managers"},
+     *      summary = "",
+     *      path = "/licensesAdmin/annualAllocation",
+     *      @SWG\Parameter(
+     *          name = "pol_id",
+     *          description = "date from which you are looking for holidays",
+     *          type = "string",
+     *          format = "date",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Parameter(
+     *          name = "type_id",
+     *          description = "id de la licencia a solicitar por el usuario",
+     *          type = "integer",
+     *          format = "int4",
+     *          in = "formData",
+     *          in = "formData",
+     *          required = true
+     *      ),
+     *      @SWG\Response(response = "default", ref = "#/responses/apiResponse"),
+     *      security = {{"api_key": {}}}
+     * )
+     */
+    public function assign(Request $request, Response $response, $args = []) {
+        $user = $this->getRecentUser($request);
+        if ($user->hasErrors()) {
+            return $this->returnError($response);
+        }
+
+        $vars = $request->getParsedBody();
+
+        $args['pol_id'] = isset($vars['pol_id']) ? ($vars['pol_id']) : '';
+        $args['type_id'] = isset($vars['type_id']) ? intval($vars['type_id']) : 0;
+
+        $toValid = [
+            'pol_id' => 'No se ha definido la politica de la licencia',
+            'type_id' => 'No se ha definido el tipo de la licencia'
+        ];
+
+        if ($this->hasEmptyVariables($vars, $toValid)) {
+            return $this->returnError($response);
+        }
+
+        $manager = new Manager($user);
+        $result = $manager->assign($args);
+        if (empty($result)) {
+            return $this->returnError($response, ['Error al procesar la asginacion.']);
+        }
+
+
+        $j = new JsonResponse();
+        return $j->render($response, ['Se han asignado las licencias con exito']);
+    }
+
+}
